@@ -5,8 +5,12 @@ import type {
   AuditRecord,
   AuditReport,
   CueHit,
+  DecisionSource,
+  EntityDecision,
+  EntitySummary,
   ExportResult,
   Hit,
+  HitException,
   MaskRule,
   PreviewResult,
   SuppressedHit,
@@ -46,6 +50,11 @@ export function normalizeEntity(raw: string): string {
 }
 
 export function aliasMapKey(ruleId: string, entityKey: string): string {
+  return `${ruleId} ${entityKey}`;
+}
+
+/** 实体决定的索引键：规则 id + 实体键（与化名表同构） */
+export function entityDecisionKey(ruleId: string, entityKey: string): string {
   return `${ruleId} ${entityKey}`;
 }
 
@@ -179,8 +188,8 @@ interface RawHit {
   end: number; // 不含
   match: string;
   replacement: string;
-  /** 化名规则的实体键；模板规则为 undefined */
-  entityKey?: string;
+  /** 实体键（NFKC + trim）：所有规则都计算，供实体决策与稳定化名使用 */
+  entityKey: string;
 }
 
 function hitKey(cueIndex: number, start: string, h: RawHit): string {
@@ -228,6 +237,8 @@ export function buildPreview(input: {
   vtt: string;
   rules: MaskRule[];
   revertedKeys?: string[];
+  hitExceptions?: HitException[];
+  entityDecisions?: EntityDecision[];
   aliases?: AliasEntry[];
 }): PreviewResult {
   const parsed = parseVtt(input.vtt);
@@ -236,7 +247,17 @@ export function buildPreview(input: {
   for (const e of errors) parsed.errors.push(`规则 ${e.ruleId} 正则无效：${e.message}`);
 
   const ruleById = new Map(normalizedRules.map((r) => [r.id, r]));
-  const reverted = new Set(input.revertedKeys ?? []);
+
+  /* ---------- 逐条例外：旧版 revertedKeys 兼容并入，显式例外优先 ---------- */
+  const exceptions = new Map<string, 'applied' | 'reverted'>();
+  for (const k of input.revertedKeys ?? []) exceptions.set(k, 'reverted');
+  for (const e of input.hitExceptions ?? []) exceptions.set(e.key, e.state);
+
+  /* ---------- 实体决定：规则 + 实体键 → 始终应用 / 始终保留 ---------- */
+  const decisions = new Map<string, EntityDecision>();
+  for (const d of input.entityDecisions ?? []) {
+    decisions.set(entityDecisionKey(d.ruleId, d.entityKey), d);
+  }
 
   /* ---------- 化名状态：载入已持久映射，序号只增不复用 ---------- */
   const aliases: AliasEntry[] = (input.aliases ?? []).map((a) => ({ ...a }));
@@ -276,7 +297,7 @@ export function buildPreview(input: {
           end: m.index + matched.length,
           match: matched,
           replacement: isAlias ? '' : applyTemplate(rule.replacement, matched, rule.name, m),
-          entityKey: isAlias ? normalizeEntity(matched) : undefined,
+          entityKey: normalizeEntity(matched),
         });
       }
     }
@@ -302,6 +323,9 @@ export function buildPreview(input: {
   let totalHits = 0;
   let appliedHits = 0;
   let revertedHits = 0;
+  let exceptionHits = 0;
+  /** 实体决策列表：按首次命中顺序登记，最后叠加仅存在于决定中的实体 */
+  const entityMap = new Map<string, EntitySummary>();
 
   const cueByIndex = new Map(cues.map((c) => [c.index, c]));
   for (const { index, kept } of mergedByCue) {
@@ -309,7 +333,7 @@ export function buildPreview(input: {
     const hits: Hit[] = kept.map((h) => {
       let aliasName: string | undefined;
       const rule = ruleById.get(h.ruleId);
-      if (rule?.mode === 'alias' && h.entityKey !== undefined) {
+      if (rule?.mode === 'alias') {
         const mapKey = aliasMapKey(h.ruleId, h.entityKey);
         let entry = aliasByKey.get(mapKey);
         if (!entry) {
@@ -337,11 +361,51 @@ export function buildPreview(input: {
         aliasName = entry.alias;
       }
 
+      /* ---------- 最终状态：逐条例外 > 实体决定 > 默认应用 ---------- */
       const key = hitKey(cue.index, cue.start, h);
-      const isReverted = reverted.has(key);
+      const decision = decisions.get(entityDecisionKey(h.ruleId, h.entityKey));
+      const exception = exceptions.get(key);
+      let isReverted: boolean;
+      let decisionSource: DecisionSource;
+      if (exception !== undefined) {
+        isReverted = exception === 'reverted';
+        decisionSource = 'exception';
+        exceptionHits++;
+      } else if (decision) {
+        isReverted = decision.action === 'keep';
+        decisionSource = 'entity';
+      } else {
+        isReverted = false;
+        decisionSource = 'default';
+      }
       if (isReverted) revertedHits++;
       else appliedHits++;
       totalHits++;
+
+      /* ---------- 实体决策列表统计（仅胜出命中；被抑制项不生成例外） ---------- */
+      const eKey = entityDecisionKey(h.ruleId, h.entityKey);
+      let summary = entityMap.get(eKey);
+      if (!summary) {
+        summary = {
+          ruleId: h.ruleId,
+          ruleName: h.ruleName,
+          entityKey: h.entityKey,
+          sourceText: h.match,
+          decision: decision?.action ?? null,
+          decidedAt: decision?.decidedAt,
+          totalHits: 0,
+          appliedHits: 0,
+          revertedHits: 0,
+          exceptionHits: 0,
+        };
+        entityMap.set(eKey, summary);
+      }
+      summary.totalHits++;
+      if (isReverted) summary.revertedHits++;
+      else summary.appliedHits++;
+      if (decisionSource === 'exception') summary.exceptionHits++;
+      summary.sourceText = h.match;
+
       return {
         key,
         ruleId: h.ruleId,
@@ -352,11 +416,31 @@ export function buildPreview(input: {
         match: h.match,
         replacement: h.replacement,
         reverted: isReverted,
+        decisionSource,
         entityKey: h.entityKey,
         alias: aliasName,
       };
     });
     cue.hits = hits;
+  }
+
+  /* ---------- 已持久决定但当前无命中的实体也列入（决定仍生效于未来命中） ---------- */
+  for (const d of input.entityDecisions ?? []) {
+    const eKey = entityDecisionKey(d.ruleId, d.entityKey);
+    if (!entityMap.has(eKey)) {
+      entityMap.set(eKey, {
+        ruleId: d.ruleId,
+        ruleName: ruleById.get(d.ruleId)?.name ?? '',
+        entityKey: d.entityKey,
+        sourceText: '',
+        decision: d.action,
+        decidedAt: d.decidedAt,
+        totalHits: 0,
+        appliedHits: 0,
+        revertedHits: 0,
+        exceptionHits: 0,
+      });
+    }
   }
 
   return {
@@ -365,9 +449,11 @@ export function buildPreview(input: {
     appliedHits,
     revertedHits,
     suppressedHits,
+    exceptionHits,
     cues,
     parseErrors: parsed.errors,
     aliases,
+    entities: Array.from(entityMap.values()),
   };
 }
 
@@ -395,6 +481,8 @@ export function exportResult(input: {
   vtt: string;
   rules: MaskRule[];
   revertedKeys?: string[];
+  hitExceptions?: HitException[];
+  entityDecisions?: EntityDecision[];
   aliases?: AliasEntry[];
   jobId?: string;
 }): ExportResult {
@@ -419,6 +507,7 @@ export function exportResult(input: {
         status: h.reverted ? 'reverted' : 'applied',
         entityKey: h.entityKey,
         alias: h.alias,
+        decisionSource: h.decisionSource,
       });
     }
     for (const s of cue.suppressed) {
@@ -439,7 +528,7 @@ export function exportResult(input: {
   const sha256 = createHash('sha256').update(input.vtt, 'utf8').digest('hex');
   const audit: AuditReport = {
     app: 'subtitle-mask-console',
-    version: 2,
+    version: 3,
     generatedAt: new Date().toISOString(),
     source: {
       sha256,
@@ -452,9 +541,16 @@ export function exportResult(input: {
       appliedHits: preview.appliedHits,
       revertedHits: preview.revertedHits,
       suppressedHits: preview.suppressedHits,
+      exceptionHits: preview.exceptionHits,
     },
     records,
     aliases: preview.aliases,
+    entityDecisions: (input.entityDecisions ?? []).map((d) => ({
+      ruleId: d.ruleId,
+      entityKey: d.entityKey,
+      action: d.action,
+      decidedAt: d.decidedAt,
+    })),
   };
 
   return {

@@ -8,7 +8,8 @@ import {
   plainText,
 } from './engine';
 import { PRESETS, SAMPLE_VTT } from './presets';
-import type { AliasEntry, MaskRule } from './types';
+import { migrateJobState } from './store';
+import type { AliasEntry, EntityDecision, MaskRule } from './types';
 
 let passed = 0;
 function test(name: string, fn: () => void): void {
@@ -268,6 +269,240 @@ test('稳定化名：与模板规则并存，优先级抑制照常', () => {
   const firstCue = v.cues[0];
   assert.strictEqual(firstCue.hits[0].replacement, '张*');
   assert.ok(firstCue.suppressed.some((s) => s.ruleName === '姓名-稳定化名' && s.entityKey === '张伟'));
+});
+
+/* ---------------------------- 实体决策 ---------------------------- */
+
+const DECIDE_VTT = `WEBVTT
+
+00:00:00.000 --> 00:00:02.000
+客服张伟先生，工号 1001。
+
+00:00:02.500 --> 00:00:05.000
+张伟先生再次来电。
+`;
+
+function keepDecision(ruleId: string, entityKey: string): EntityDecision {
+  return { ruleId, entityKey, action: 'keep', decidedAt: '2026-09-19T00:00:00.000Z' };
+}
+
+/** 始终保留：同实体全部命中保留原文，后续新出现的同实体命中自动继承 */
+test('实体决策：始终保留作用于同实体全部命中，新命中自动继承', () => {
+  const rule = presetRule('姓名');
+  const decisions = [keepDecision(rule.id, '张伟')];
+  const v1 = buildPreview({ vtt: DECIDE_VTT, rules: [rule], entityDecisions: decisions });
+  const zhang = v1.cues.flatMap((c) => c.hits).filter((h) => h.match === '张伟');
+  assert.strictEqual(zhang.length, 2);
+  assert.ok(zhang.every((h) => h.reverted && h.decisionSource === 'entity'));
+
+  // 新增一条含同实体的 cue：无需任何操作即继承保留
+  const more = DECIDE_VTT + '\n00:00:06.000 --> 00:00:08.000\n张伟先生三顾茅庐。\n';
+  const v2 = buildPreview({ vtt: more, rules: [rule], entityDecisions: decisions });
+  const zhang2 = v2.cues.flatMap((c) => c.hits).filter((h) => h.match === '张伟');
+  assert.strictEqual(zhang2.length, 3);
+  assert.ok(zhang2.every((h) => h.reverted && h.decisionSource === 'entity'));
+
+  // 导出 VTT 与预览同一最终状态：全部保留原文
+  const ex = exportResult({ vtt: DECIDE_VTT, rules: [rule], entityDecisions: decisions });
+  assert.ok(ex.vtt.includes('张伟先生'));
+  assert.ok(!ex.vtt.includes('张*'));
+});
+
+/** 始终应用 + 逐条例外：例外优先于实体决定，清除例外后恢复继承 */
+test('实体决策：逐条例外优先于实体决定，清除后恢复继承', () => {
+  const rule = presetRule('姓名');
+  const decisions = [keepDecision(rule.id, '张伟')];
+  const v1 = buildPreview({ vtt: DECIDE_VTT, rules: [rule], entityDecisions: decisions });
+  const target = v1.cues[0].hits.find((h) => h.match === '张伟')!;
+  assert.ok(target.reverted);
+
+  // 对该命中写入显式「应用」例外：覆盖实体保留决定
+  const v2 = buildPreview({
+    vtt: DECIDE_VTT,
+    rules: [rule],
+    entityDecisions: decisions,
+    hitExceptions: [{ key: target.key, state: 'applied' }],
+  });
+  const t2 = v2.cues[0].hits.find((h) => h.key === target.key)!;
+  assert.strictEqual(t2.reverted, false);
+  assert.strictEqual(t2.decisionSource, 'exception');
+  // 其余同实体命中仍继承保留
+  const others = v2.cues
+    .flatMap((c) => c.hits)
+    .filter((h) => h.match === '张伟' && h.key !== target.key);
+  assert.ok(others.length === 1 && others.every((h) => h.reverted && h.decisionSource === 'entity'));
+
+  // 清除例外：恢复继承实体保留决定
+  const v3 = buildPreview({
+    vtt: DECIDE_VTT,
+    rules: [rule],
+    entityDecisions: decisions,
+    hitExceptions: [],
+  });
+  assert.ok(v3.cues[0].hits.find((h) => h.key === target.key)!.reverted);
+
+  // 反向：实体决定为始终应用，逐条撤销例外使其保留原文
+  const applyDecisions: EntityDecision[] = [
+    { ruleId: rule.id, entityKey: '张伟', action: 'apply', decidedAt: '2026-09-19T00:00:00.000Z' },
+  ];
+  const v4 = buildPreview({
+    vtt: DECIDE_VTT,
+    rules: [rule],
+    entityDecisions: applyDecisions,
+    hitExceptions: [{ key: target.key, state: 'reverted' }],
+  });
+  const t4 = v4.cues[0].hits.find((h) => h.key === target.key)!;
+  assert.ok(t4.reverted && t4.decisionSource === 'exception');
+  const inherited = v4.cues.flatMap((c) => c.hits).filter((h) => h.match === '张伟' && h.key !== target.key);
+  assert.ok(inherited.every((h) => !h.reverted && h.decisionSource === 'entity'));
+});
+
+/** 实体键 NFKC 归一：全角 / 半角写法收敛为同一实体，决定一并继承（模板规则同样生效） */
+test('实体决策：NFKC 归一后同实体跨写法继承决定', () => {
+  const rule: MaskRule = {
+    id: 'num',
+    name: '编号',
+    pattern: '[0-9０-９]{4}',
+    flags: 'g',
+    replacement: '****',
+    priority: 10,
+    enabled: true,
+    mode: 'template',
+    aliasPrefix: '',
+  };
+  const vtt = 'WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n编号 1234 与 １２３４\n';
+  const v = buildPreview({
+    vtt,
+    rules: [rule],
+    entityDecisions: [keepDecision('num', '1234')],
+  });
+  const hits = v.cues[0].hits;
+  assert.strictEqual(hits.length, 2);
+  assert.ok(hits.every((h) => h.entityKey === '1234'));
+  assert.ok(hits.every((h) => h.reverted && h.decisionSource === 'entity'));
+});
+
+/** 重叠合并后实体决定只对胜出命中生效；被抑制命中不生成例外、不受决定影响 */
+test('实体决策：被抑制命中不受影响，决定只作用于胜出命中', () => {
+  const idRule = presetRule('身份证');
+  const bankRule = presetRule('银行卡');
+  const idVtt = 'WEBVTT\n\n00:00:00.000 --> 00:00:02.000\n身份证号 110101199003071234 登记。\n';
+  const decisions = [keepDecision(bankRule.id, normalizeEntity('110101199003071234'))];
+
+  // 身份证(80) 胜出，银行卡被抑制：保留决定不落在任何胜出命中上
+  const v1 = buildPreview({ vtt: idVtt, rules: [idRule, bankRule], entityDecisions: decisions });
+  assert.ok(v1.cues[0].suppressed.some((s) => s.ruleName === '银行卡'));
+  assert.strictEqual(v1.revertedHits, 0);
+  assert.strictEqual(v1.exceptionHits, 0);
+  const idHit = v1.cues[0].hits.find((h) => h.ruleName === '身份证')!;
+  assert.ok(!idHit.reverted && idHit.decisionSource === 'default');
+
+  // 规则变化（身份证停用）后银行卡成为胜出命中，继承保留决定
+  const v2 = buildPreview({
+    vtt: idVtt,
+    rules: [{ ...idRule, enabled: false }, bankRule],
+    entityDecisions: decisions,
+  });
+  const bank = v2.cues[0].hits.find((h) => h.ruleName === '银行卡')!;
+  assert.ok(bank.reverted && bank.decisionSource === 'entity');
+});
+
+/** 审计：每条记录携带决策来源，报告含实体决定与例外统计，导出与预览同一最终状态 */
+test('实体决策：审计记录决策来源，导出与预览状态一致', () => {
+  const rule = presetRule('姓名');
+  const decisions = [keepDecision(rule.id, '张伟')];
+  const v1 = buildPreview({ vtt: DECIDE_VTT, rules: [rule], entityDecisions: decisions });
+  const exKey = v1.cues[0].hits.find((h) => h.match === '张伟')!.key;
+  const input = {
+    vtt: DECIDE_VTT,
+    rules: [rule],
+    entityDecisions: decisions,
+    hitExceptions: [{ key: exKey, state: 'applied' as const }],
+  };
+  const ex = exportResult(input);
+  const recs = ex.audit.records.filter((r) => r.entityKey === '张伟');
+  assert.ok(recs.some((r) => r.status === 'applied' && r.decisionSource === 'exception'));
+  assert.ok(recs.some((r) => r.status === 'reverted' && r.decisionSource === 'entity'));
+  assert.strictEqual(ex.audit.version, 3);
+  assert.strictEqual(ex.audit.stats.exceptionHits, 1);
+  assert.ok(ex.audit.entityDecisions!.some((d) => d.entityKey === '张伟' && d.action === 'keep'));
+  // 导出 VTT 与预览最终状态一致：例外处替换，其余保留
+  assert.ok(ex.vtt.includes('张*先生'));
+  assert.ok(ex.vtt.includes('张伟先生再次来电'));
+});
+
+/** 实体决策列表：汇总命中 / 例外统计，包含当前无命中的持久决定 */
+test('实体决策：实体列表汇总统计，含未命中实体的持久决定', () => {
+  const rule = presetRule('姓名');
+  const decisions: EntityDecision[] = [
+    keepDecision(rule.id, '张伟'),
+    { ruleId: rule.id, entityKey: '李四', action: 'apply', decidedAt: '2026-09-19T00:00:00.000Z' },
+  ];
+  const v1 = buildPreview({ vtt: DECIDE_VTT, rules: [rule], entityDecisions: decisions });
+  const zw = v1.entities.find((e) => e.entityKey === '张伟')!;
+  assert.strictEqual(zw.decision, 'keep');
+  assert.strictEqual(zw.totalHits, 2);
+  assert.strictEqual(zw.revertedHits, 2);
+  assert.strictEqual(zw.exceptionHits, 0);
+  // 当前无命中但已持久决定的实体也列出（决定对未来命中生效）
+  const ls = v1.entities.find((e) => e.entityKey === '李四')!;
+  assert.strictEqual(ls.totalHits, 0);
+  assert.strictEqual(ls.decision, 'apply');
+
+  // 写入一条例外后：实体的例外计数与全局例外计数联动
+  const key = v1.cues[0].hits.find((h) => h.match === '张伟')!.key;
+  const v2 = buildPreview({
+    vtt: DECIDE_VTT,
+    rules: [rule],
+    entityDecisions: decisions,
+    hitExceptions: [{ key, state: 'applied' }],
+  });
+  assert.strictEqual(v2.entities.find((e) => e.entityKey === '张伟')!.exceptionHits, 1);
+  assert.strictEqual(v2.exceptionHits, 1);
+});
+
+/** 兼容：旧版 revertedKeys 仍按逐条「撤销」例外生效 */
+test('兼容：旧版 revertedKeys 作为逐条撤销例外生效', () => {
+  const rules = [presetRule('手机号')];
+  const v1 = buildPreview({ vtt: SAMPLE_VTT, rules });
+  const key = v1.cues[0].hits[0].key;
+  const v2 = buildPreview({ vtt: SAMPLE_VTT, rules, revertedKeys: [key] });
+  const h = v2.cues[0].hits[0];
+  assert.ok(h.reverted && h.decisionSource === 'exception');
+  // 显式例外与旧字段并存时，显式例外优先
+  const v3 = buildPreview({
+    vtt: SAMPLE_VTT,
+    rules,
+    revertedKeys: [key],
+    hitExceptions: [{ key, state: 'applied' }],
+  });
+  assert.ok(!v3.cues[0].hits[0].reverted);
+});
+
+/** 兼容：旧 job.json（revertedKeys 时代）迁移为逐条例外与空实体决定 */
+test('兼容：旧 job.json 迁移为逐条例外与空实体决定', () => {
+  const migrated = migrateJobState({
+    jobId: 'j1',
+    vtt: 'WEBVTT',
+    rules: [],
+    revertedKeys: ['k1', 'k2'],
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  });
+  assert.deepStrictEqual(migrated.hitExceptions, [
+    { key: 'k1', state: 'reverted' },
+    { key: 'k2', state: 'reverted' },
+  ]);
+  assert.deepStrictEqual(migrated.entityDecisions, []);
+  assert.deepStrictEqual(migrated.aliases, []);
+
+  // 新格式存在时优先，旧字段不再生效
+  const m2 = migrateJobState({
+    hitExceptions: [{ key: 'x', state: 'applied' }],
+    entityDecisions: [{ ruleId: 'r', entityKey: 'e', action: 'keep', decidedAt: 't' }],
+    revertedKeys: ['k1'],
+  });
+  assert.deepStrictEqual(m2.hitExceptions, [{ key: 'x', state: 'applied' }]);
+  assert.strictEqual(m2.entityDecisions.length, 1);
 });
 
 console.log(`\n引擎自测全部通过（${passed} 项）`);

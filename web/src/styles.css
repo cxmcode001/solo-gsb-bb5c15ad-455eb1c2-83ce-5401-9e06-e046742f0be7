@@ -453,6 +453,167 @@ select:focus {
   color: var(--suppressed);
 }
 
+/* ---------------- 实体决策 ---------------- */
+.entity-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.entity-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--border);
+  background: #fff;
+  border-radius: 14px;
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.entity-filter:hover {
+  border-color: #94a3b8;
+}
+.entity-filter.active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+  font-weight: 600;
+}
+.entity-filter-count {
+  background: rgba(0, 0, 0, 0.08);
+  border-radius: 8px;
+  padding: 0 6px;
+  font-size: 11px;
+  font-family: var(--mono);
+}
+.entity-filter.active .entity-filter-count {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.entity-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.entity-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: #fcfdff;
+  font-size: 12.5px;
+}
+.entity-item.entity-apply {
+  border-color: var(--applied-border);
+  background: var(--applied-bg);
+}
+.entity-item.entity-keep {
+  border-color: var(--reverted-border);
+  background: var(--reverted-bg);
+}
+.entity-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+.entity-rule {
+  color: var(--muted);
+  font-size: 11.5px;
+  min-width: 72px;
+}
+.entity-key {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 180px;
+}
+.entity-stats {
+  color: var(--muted);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.entity-ex-tag {
+  font-style: normal;
+  color: var(--suppressed);
+  font-weight: 700;
+  margin-left: 6px;
+}
+.entity-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.decision-switch {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: #fff;
+}
+.decision-switch button {
+  border: none;
+  background: none;
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.decision-switch button + button {
+  border-left: 1px solid var(--border);
+}
+.decision-switch button:hover {
+  background: #f1f5f9;
+}
+.decision-switch button.active {
+  background: var(--primary);
+  color: #fff;
+  font-weight: 600;
+}
+.entity-item.entity-keep .decision-switch button.active {
+  background: var(--reverted);
+}
+.entity-item.entity-apply .decision-switch button.active {
+  background: var(--applied);
+}
+
+/* 命中上的决策来源标记 */
+.hit-src {
+  font-size: 9.5px;
+  font-weight: 700;
+  padding: 0 4px;
+  border-radius: 7px;
+  line-height: 1.6;
+}
+.hit-src-entity {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+.hit-src-exception {
+  background: var(--suppressed-bg);
+  color: var(--suppressed);
+}
+.hit-inherit {
+  color: var(--suppressed);
+}
+.stat-exception {
+  color: var(--suppressed);
+  font-weight: 600;
+}
+
 .empty-tip {
   color: var(--muted);
   padding: 16px;

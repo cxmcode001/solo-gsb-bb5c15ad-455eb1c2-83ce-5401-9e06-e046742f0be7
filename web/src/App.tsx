@@ -2,16 +2,20 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from './api';
 import type {
   AliasEntry,
+  EntityDecision,
+  EntityDecisionAction,
   ExportResult,
+  HitException,
   MaskRule,
   Preset,
   PreviewResult,
 } from './types';
-import { uid, normalizeRule } from './utils';
+import { uid, normalizeRule, inheritedState, withExceptionTarget } from './utils';
 import { SAMPLE_VTT } from './sample';
 import { VttInput } from './components/VttInput';
 import { RulesPanel } from './components/RulesPanel';
 import { AliasPanel } from './components/AliasPanel';
+import { EntityPanel } from './components/EntityPanel';
 import { Preview } from './components/Preview';
 import { ExportModal } from './components/ExportModal';
 
@@ -20,7 +24,10 @@ type SaveState = 'idle' | 'saving' | 'saved' | 'error';
 export default function App() {
   const [vtt, setVtt] = useState('');
   const [rules, setRules] = useState<MaskRule[]>([]);
-  const [revertedKeys, setRevertedKeys] = useState<string[]>([]);
+  /** 逐条命中例外（显式覆盖实体决定） */
+  const [hitExceptions, setHitExceptions] = useState<HitException[]>([]);
+  /** 实体级决定（规则 + NFKC 实体键 → 始终应用 / 始终保留） */
+  const [entityDecisions, setEntityDecisions] = useState<EntityDecision[]>([]);
   const [aliases, setAliases] = useState<AliasEntry[]>([]);
   const [presets, setPresets] = useState<Preset[]>([]);
   const [preview, setPreview] = useState<PreviewResult | null>(null);
@@ -51,7 +58,8 @@ export default function App() {
         if (job && (job.vtt || job.rules.length > 0)) {
           setVtt(job.vtt);
           setRules(job.rules.map(normalizeRule));
-          setRevertedKeys(job.revertedKeys ?? []);
+          setHitExceptions(job.hitExceptions ?? []);
+          setEntityDecisions(job.entityDecisions ?? []);
           setAliases(job.aliases ?? []);
           setUpdatedAt(job.updatedAt);
         } else {
@@ -81,7 +89,7 @@ export default function App() {
     const reqId = ++previewReq.current;
     previewTimer.current = setTimeout(async () => {
       try {
-        const p = await api.preview(vtt, rules, revertedKeys, aliases);
+        const p = await api.preview({ vtt, rules, hitExceptions, entityDecisions, aliases });
         // 过期响应（用户已继续编辑 / 改名）直接丢弃
         if (reqId !== previewReq.current) return;
         setPreview(p);
@@ -100,7 +108,7 @@ export default function App() {
     return () => {
       if (previewTimer.current) clearTimeout(previewTimer.current);
     };
-  }, [vtt, rules, revertedKeys, aliases, hydrated]);
+  }, [vtt, rules, hitExceptions, entityDecisions, aliases, hydrated]);
 
   /* ------------- 防抖自动保存（800ms），刷新可恢复 ------------- */
   useEffect(() => {
@@ -109,7 +117,7 @@ export default function App() {
     setSaveState('saving');
     saveTimer.current = setTimeout(async () => {
       try {
-        const { job } = await api.saveJob(vtt, rules, revertedKeys, aliases);
+        const { job } = await api.saveJob({ vtt, rules, hitExceptions, entityDecisions, aliases });
         setUpdatedAt(job.updatedAt);
         setSaveState('saved');
       } catch {
@@ -119,25 +127,86 @@ export default function App() {
     return () => {
       if (saveTimer.current) clearTimeout(saveTimer.current);
     };
-  }, [vtt, rules, revertedKeys, aliases, hydrated]);
+  }, [vtt, rules, hitExceptions, entityDecisions, aliases, hydrated]);
 
-  /* ------------- 撤销 / 应用 ------------- */
-  const toggleHit = useCallback((key: string) => {
-    setRevertedKeys((keys) =>
-      keys.includes(key) ? keys.filter((k) => k !== key) : [...keys, key],
-    );
+  /* ------------- 逐条例外（显式覆盖实体决定） ------------- */
+  const toggleHit = useCallback(
+    (key: string) => {
+      const hit = preview?.cues.flatMap((c) => c.hits).find((h) => h.key === key);
+      if (!hit) return;
+      // 目标为当前最终状态的反面；与继承状态相同时清除例外（恢复继承）
+      const target = hit.reverted ? 'applied' : 'reverted';
+      setHitExceptions((prev) =>
+        withExceptionTarget(
+          prev,
+          [{ key, inherited: inheritedState(hit, entityDecisions) }],
+          target,
+        ),
+      );
+    },
+    [preview, entityDecisions],
+  );
+
+  /** 清除单条例外：恢复继承实体决定（或默认应用） */
+  const clearException = useCallback((key: string) => {
+    setHitExceptions((prev) => prev.filter((e) => e.key !== key));
   }, []);
-  const revertAll = useCallback(() => {
-    if (!preview) return;
-    setRevertedKeys(preview.cues.flatMap((c) => c.hits.map((h) => h.key)));
-  }, [preview]);
-  const applyAll = useCallback(() => setRevertedKeys([]), []);
 
-  /* 规则变更后，清除已不存在的撤销项（key 由 cue 序号+区间+规则决定，天然稳定） */
+  /** 全部应用 / 全部撤销：对当前全部胜出命中写入目标状态（与继承一致者清除例外） */
+  const bulkSet = useCallback(
+    (target: 'applied' | 'reverted') => {
+      if (!preview) return;
+      const entries = preview.cues
+        .flatMap((c) => c.hits)
+        .map((h) => ({ key: h.key, inherited: inheritedState(h, entityDecisions) }));
+      setHitExceptions((prev) => withExceptionTarget(prev, entries, target));
+    },
+    [preview, entityDecisions],
+  );
+  const revertAll = useCallback(() => bulkSet('reverted'), [bulkSet]);
+  const applyAll = useCallback(() => bulkSet('applied'), [bulkSet]);
+
+  /* ------------- 实体级决定（持久化，新命中自动继承） ------------- */
+  const setEntityDecision = useCallback(
+    (ruleId: string, entityKey: string, action: EntityDecisionAction | null) => {
+      setEntityDecisions((prev) => {
+        const rest = prev.filter(
+          (d) => !(d.ruleId === ruleId && d.entityKey === entityKey),
+        );
+        if (!action) return rest;
+        return [
+          ...rest,
+          { ruleId, entityKey, action, decidedAt: new Date().toISOString() },
+        ];
+      });
+    },
+    [],
+  );
+
+  /** 清除某实体当前全部命中的例外，恢复继承 */
+  const clearEntityExceptions = useCallback(
+    (ruleId: string, entityKey: string) => {
+      if (!preview) return;
+      const keys = new Set(
+        preview.cues
+          .flatMap((c) => c.hits)
+          .filter((h) => h.ruleId === ruleId && h.entityKey === entityKey)
+          .map((h) => h.key),
+      );
+      setHitExceptions((prev) => prev.filter((e) => !keys.has(e.key)));
+    },
+    [preview],
+  );
+
+  /* 规则 / 文本变化后，清除已不存在命中的例外（key 由 cue 序号+区间+规则决定，天然稳定；
+     被抑制命中不产生例外）。内容不变时保持原引用，避免触发预览循环。 */
   useEffect(() => {
     if (!preview) return;
     const valid = new Set(preview.cues.flatMap((c) => c.hits.map((h) => h.key)));
-    setRevertedKeys((keys) => keys.filter((k) => valid.has(k)));
+    setHitExceptions((prev) => {
+      const next = prev.filter((e) => valid.has(e.key));
+      return next.length === prev.length ? prev : next;
+    });
   }, [preview]);
 
   /* ------------- 化名表手动改名 / 恢复自动 ------------- */
@@ -164,7 +233,7 @@ export default function App() {
   const doExport = async () => {
     if (!vtt.trim()) return;
     try {
-      const result = await api.export(vtt, rules, revertedKeys, aliases);
+      const result = await api.export({ vtt, rules, hitExceptions, entityDecisions, aliases });
       setExportData(result);
     } catch (e) {
       setError(`导出失败：${(e as Error).message}`);
@@ -185,7 +254,7 @@ export default function App() {
           <span className="logo">🛡</span>
           <div>
             <h1>字幕脱敏审校台</h1>
-            <p>WebVTT 本机正则脱敏 · 优先级合并 · 逐条撤销 · 稳定化名 · 审计导出</p>
+            <p>WebVTT 本机正则脱敏 · 优先级合并 · 实体决策 · 逐条例外 · 稳定化名 · 审计导出</p>
           </div>
         </div>
         <div className="topbar-right">
@@ -213,6 +282,11 @@ export default function App() {
             onClear={() => setVtt('')}
           />
           <RulesPanel rules={rules} presets={presets} onChange={setRules} />
+          <EntityPanel
+            entities={preview?.entities ?? []}
+            onDecide={setEntityDecision}
+            onClearExceptions={clearEntityExceptions}
+          />
           <AliasPanel
             rules={rules}
             aliases={aliases}
@@ -225,6 +299,7 @@ export default function App() {
             preview={preview}
             loading={loading}
             onToggleHit={toggleHit}
+            onClearException={clearException}
             onRevertAll={revertAll}
             onApplyAll={applyAll}
           />

@@ -24,6 +24,26 @@ export interface AliasEntry {
   sourceText?: string;
 }
 
+/** 命中最终状态的决策来源：默认应用 / 继承实体决定 / 逐条显式例外 */
+export type DecisionSource = 'default' | 'entity' | 'exception';
+
+/** 实体级决定动作：apply 始终应用替换；keep 始终保留原文 */
+export type EntityDecisionAction = 'apply' | 'keep';
+
+/** 实体级决定：按「规则 + NFKC 归一实体键」持久化，新命中自动继承 */
+export interface EntityDecision {
+  ruleId: string;
+  entityKey: string;
+  action: EntityDecisionAction;
+  decidedAt: string;
+}
+
+/** 逐条命中例外：显式覆盖实体决定；清除后恢复继承 */
+export interface HitException {
+  key: string;
+  state: 'applied' | 'reverted';
+}
+
 export interface Hit {
   key: string;
   ruleId: string;
@@ -34,7 +54,10 @@ export interface Hit {
   match: string;
   replacement: string;
   reverted: boolean;
-  entityKey?: string;
+  /** 最终状态的决策来源 */
+  decisionSource: DecisionSource;
+  /** 实体键：NFKC + trim 后的原文（实体决策与稳定化名共用） */
+  entityKey: string;
   alias?: string;
 }
 
@@ -48,7 +71,7 @@ export interface SuppressedHit {
   reason: 'overlap';
   winnerRuleId: string;
   winnerRuleName: string;
-  entityKey?: string;
+  entityKey: string;
 }
 
 export interface CueHit {
@@ -63,22 +86,45 @@ export interface CueHit {
   suppressed: SuppressedHit[];
 }
 
+/** 实体决策列表行：实体 + 决定 + 命中统计 */
+export interface EntitySummary {
+  ruleId: string;
+  /** 规则名；规则已删除时为空串 */
+  ruleName: string;
+  entityKey: string;
+  sourceText: string;
+  /** 当前实体决定；null = 待定 */
+  decision: EntityDecisionAction | null;
+  decidedAt?: string;
+  totalHits: number;
+  appliedHits: number;
+  revertedHits: number;
+  exceptionHits: number;
+}
+
 export interface PreviewResult {
   cueCount: number;
   totalHits: number;
   appliedHits: number;
   revertedHits: number;
   suppressedHits: number;
+  /** 有显式例外的胜出命中数 */
+  exceptionHits: number;
   cues: CueHit[];
   parseErrors: string[];
   aliases: AliasEntry[];
+  /** 实体决策列表（当前命中实体 + 已持久决定的实体） */
+  entities: EntitySummary[];
 }
 
 export interface JobState {
   jobId: string;
   vtt: string;
   rules: MaskRule[];
-  revertedKeys: string[];
+  /** 逐条命中例外 */
+  hitExceptions: HitException[];
+  /** 实体级决定 */
+  entityDecisions: EntityDecision[];
   aliases: AliasEntry[];
   updatedAt: string;
 }
@@ -94,6 +140,8 @@ export interface AuditRecord {
   suppressedBy?: { id: string; name: string };
   entityKey?: string;
   alias?: string;
+  /** 最终状态的决策来源（被抑制命中无此字段） */
+  decisionSource?: DecisionSource;
 }
 
 export interface AuditReport {
@@ -107,9 +155,11 @@ export interface AuditReport {
     appliedHits: number;
     revertedHits: number;
     suppressedHits: number;
+    exceptionHits: number;
   };
   records: AuditRecord[];
   aliases?: AliasEntry[];
+  entityDecisions?: EntityDecision[];
 }
 
 export interface ExportResult {

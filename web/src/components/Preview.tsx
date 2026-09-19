@@ -5,6 +5,7 @@ interface Props {
   preview: PreviewResult | null;
   loading: boolean;
   onToggleHit: (key: string) => void;
+  onClearException: (key: string) => void;
   onRevertAll: () => void;
   onApplyAll: () => void;
 }
@@ -23,7 +24,15 @@ function segments(cue: CueHit): { text: string; hit?: Hit }[] {
   return out;
 }
 
-function CueCard({ cue, onToggleHit }: { cue: CueHit; onToggleHit: (k: string) => void }) {
+function CueCard({
+  cue,
+  onToggleHit,
+  onClearException,
+}: {
+  cue: CueHit;
+  onToggleHit: (k: string) => void;
+  onClearException: (k: string) => void;
+}) {
   const segs = useMemo(() => segments(cue), [cue]);
   return (
     <article className="cue-card">
@@ -43,10 +52,26 @@ function CueCard({ cue, onToggleHit }: { cue: CueHit; onToggleHit: (k: string) =
               title={
                 s.hit.alias !== undefined
                   ? `${s.hit.ruleName}（稳定化名，优先级 ${s.hit.priority}）\n原文：${s.hit.match}\n实体键：${s.hit.entityKey}\n化名：${s.hit.alias}`
-                  : `${s.hit.ruleName}（优先级 ${s.hit.priority}）\n原文：${s.hit.match}\n替换：${s.hit.replacement}`
+                  : `${s.hit.ruleName}（优先级 ${s.hit.priority}）\n原文：${s.hit.match}\n替换：${s.hit.replacement}\n实体键：${s.hit.entityKey}`
               }
             >
               <span className="hit-label">{s.hit.ruleName}</span>
+              {s.hit.decisionSource === 'entity' && (
+                <span
+                  className="hit-src hit-src-entity"
+                  title="继承实体决定（可在左侧「实体决策」面板调整）"
+                >
+                  实体
+                </span>
+              )}
+              {s.hit.decisionSource === 'exception' && (
+                <span
+                  className="hit-src hit-src-exception"
+                  title="逐条例外：显式覆盖实体决定"
+                >
+                  例外
+                </span>
+              )}
               {s.hit.reverted ? (
                 <span className="hit-original">{s.text}</span>
               ) : (
@@ -55,10 +80,23 @@ function CueCard({ cue, onToggleHit }: { cue: CueHit; onToggleHit: (k: string) =
               <button
                 className="hit-toggle"
                 onClick={() => onToggleHit(s.hit!.key)}
-                title={s.hit.reverted ? '重新应用此替换' : '撤销此替换（恢复原文）'}
+                title={
+                  s.hit.reverted
+                    ? '应用此替换（写入逐条例外）'
+                    : '撤销此替换，恢复原文（写入逐条例外）'
+                }
               >
                 {s.hit.reverted ? '↩ 应用' : '↶ 撤销'}
               </button>
+              {s.hit.decisionSource === 'exception' && (
+                <button
+                  className="hit-toggle hit-inherit"
+                  onClick={() => onClearException(s.hit!.key)}
+                  title="清除此命中的例外，恢复继承实体决定（或默认应用）"
+                >
+                  ⟲ 继承
+                </button>
+              )}
             </span>
           ) : (
             <span key={i}>{s.text}</span>
@@ -79,7 +117,14 @@ function CueCard({ cue, onToggleHit }: { cue: CueHit; onToggleHit: (k: string) =
   );
 }
 
-export function Preview({ preview, loading, onToggleHit, onRevertAll, onApplyAll }: Props) {
+export function Preview({
+  preview,
+  loading,
+  onToggleHit,
+  onClearException,
+  onRevertAll,
+  onApplyAll,
+}: Props) {
   const [onlyMatched, setOnlyMatched] = useState(false);
 
   const cues = useMemo(() => {
@@ -121,15 +166,23 @@ export function Preview({ preview, loading, onToggleHit, onRevertAll, onApplyAll
         <div className="stat-bar">
           <span>字幕 {preview.cueCount} 条</span>
           <span className="stat-applied">将脱敏 {preview.appliedHits}</span>
-          <span className="stat-reverted">已撤销 {preview.revertedHits}</span>
+          <span className="stat-reverted">已保留 {preview.revertedHits}</span>
           <span className="stat-suppressed">重叠抑制 {preview.suppressedHits}</span>
+          {preview.exceptionHits > 0 && (
+            <span className="stat-exception">逐条例外 {preview.exceptionHits}</span>
+          )}
         </div>
       )}
 
       <div className="cue-list">
         {preview && cues.length === 0 && <div className="empty-tip">没有可显示的字幕。</div>}
         {cues.map((c) => (
-          <CueCard key={c.index} cue={c} onToggleHit={onToggleHit} />
+          <CueCard
+            key={c.index}
+            cue={c}
+            onToggleHit={onToggleHit}
+            onClearException={onClearException}
+          />
         ))}
       </div>
     </section>

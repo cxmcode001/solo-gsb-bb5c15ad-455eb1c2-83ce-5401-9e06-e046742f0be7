@@ -4,7 +4,14 @@ import { randomUUID } from 'crypto';
 import { buildPreview, exportResult, normalizeRule } from './engine';
 import { PRESETS } from './presets';
 import { JobStore } from './store';
-import type { AliasEntry, JobState, MaskRule, PreviewInput } from './types';
+import type {
+  AliasEntry,
+  EntityDecision,
+  HitException,
+  JobState,
+  MaskRule,
+  PreviewInput,
+} from './types';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), 'data');
@@ -74,8 +81,72 @@ function validateAliases(aliases: unknown): AliasEntry[] | string {
   return out;
 }
 
+/** 校验并净化逐条例外表；非法时返回错误文案 */
+function validateExceptions(exceptions: unknown): HitException[] | string {
+  if (exceptions === undefined || exceptions === null) return [];
+  if (!Array.isArray(exceptions)) return 'hitExceptions 必须是数组';
+  const out: HitException[] = [];
+  const seen = new Set<string>();
+  for (const e of exceptions) {
+    if (e === null || typeof e !== 'object') return '存在非法例外条目';
+    const x = e as Record<string, unknown>;
+    if (typeof x.key !== 'string' || !x.key) return '例外条目缺少 key';
+    if (x.state !== 'applied' && x.state !== 'reverted')
+      return `例外 ${x.key} 状态非法`;
+    if (seen.has(x.key)) continue; // 同 key 只保留第一条
+    seen.add(x.key);
+    out.push({ key: x.key, state: x.state });
+  }
+  return out;
+}
+
+/** 校验并净化实体决定表；非法时返回错误文案 */
+function validateDecisions(decisions: unknown): EntityDecision[] | string {
+  if (decisions === undefined || decisions === null) return [];
+  if (!Array.isArray(decisions)) return 'entityDecisions 必须是数组';
+  const out: EntityDecision[] = [];
+  const seen = new Set<string>();
+  for (const d of decisions) {
+    if (d === null || typeof d !== 'object') return '存在非法实体决定';
+    const x = d as Record<string, unknown>;
+    if (typeof x.ruleId !== 'string' || !x.ruleId) return '实体决定缺少 ruleId';
+    if (typeof x.entityKey !== 'string' || !x.entityKey)
+      return '实体决定缺少 entityKey';
+    if (x.action !== 'apply' && x.action !== 'keep')
+      return `实体 ${x.entityKey} 决定动作非法`;
+    const mapKey = `${x.ruleId} ${x.entityKey}`;
+    if (seen.has(mapKey)) continue; // 同实体只保留第一条
+    seen.add(mapKey);
+    out.push({
+      ruleId: x.ruleId,
+      entityKey: x.entityKey,
+      action: x.action,
+      decidedAt: typeof x.decidedAt === 'string' ? x.decidedAt : '',
+    });
+  }
+  return out;
+}
+
+/** 旧版 revertedKeys → state=reverted 的逐条例外（显式例外优先，不覆盖已有条目） */
+function legacyRevertedAsExceptions(
+  revertedKeys: unknown,
+  existing: HitException[],
+): HitException[] {
+  if (!Array.isArray(revertedKeys)) return existing;
+  const have = new Set(existing.map((e) => e.key));
+  const extra: HitException[] = [];
+  for (const k of revertedKeys) {
+    if (typeof k === 'string' && k && !have.has(k)) {
+      have.add(k);
+      extra.push({ key: k, state: 'reverted' });
+    }
+  }
+  return [...existing, ...extra];
+}
+
 function readPreviewBody(req: Request): PreviewInput {
-  const { vtt, rules, revertedKeys, aliases } = req.body as Partial<PreviewInput>;
+  const { vtt, rules, revertedKeys, hitExceptions, entityDecisions, aliases } =
+    req.body as Partial<PreviewInput>;
   if (typeof vtt !== 'string') {
     throw new Error('vtt 必须是字符串');
   }
@@ -83,12 +154,18 @@ function readPreviewBody(req: Request): PreviewInput {
   if (typeof checked === 'string') throw new Error(checked);
   const checkedAliases = validateAliases(aliases);
   if (typeof checkedAliases === 'string') throw new Error(checkedAliases);
+  const checkedExceptions = validateExceptions(hitExceptions);
+  if (typeof checkedExceptions === 'string') throw new Error(checkedExceptions);
+  const checkedDecisions = validateDecisions(entityDecisions);
+  if (typeof checkedDecisions === 'string') throw new Error(checkedDecisions);
   return {
     vtt,
     rules: checked,
     revertedKeys: Array.isArray(revertedKeys)
       ? (revertedKeys as string[]).filter((k) => typeof k === 'string')
       : [],
+    hitExceptions: checkedExceptions,
+    entityDecisions: checkedDecisions,
     aliases: checkedAliases,
   };
 }
@@ -110,12 +187,22 @@ app.get('/api/job', (_req, res) => {
 
 /** 自动保存编辑中的任务 */
 app.put('/api/job', (req, res) => {
-  const { vtt, rules, revertedKeys, aliases } = req.body as Partial<JobState>;
+  const { vtt, rules, revertedKeys, hitExceptions, entityDecisions, aliases } =
+    req.body as Partial<JobState> & { revertedKeys?: unknown };
   if (typeof vtt !== 'string') return res.status(400).json({ error: 'vtt 必须是字符串' });
   const checked = validateRules(rules);
   if (typeof checked === 'string') return res.status(400).json({ error: checked });
-  if (!Array.isArray(revertedKeys))
-    return res.status(400).json({ error: 'revertedKeys 必须是数组' });
+  // 兼容旧客户端：未传 hitExceptions 时由 revertedKeys 迁移；两者都有时合并（显式例外优先）
+  const baseExceptions =
+    hitExceptions === undefined
+      ? legacyRevertedAsExceptions(revertedKeys, [])
+      : validateExceptions(hitExceptions);
+  if (typeof baseExceptions === 'string')
+    return res.status(400).json({ error: baseExceptions });
+  const exceptions = legacyRevertedAsExceptions(revertedKeys, baseExceptions);
+  const checkedDecisions = validateDecisions(entityDecisions);
+  if (typeof checkedDecisions === 'string')
+    return res.status(400).json({ error: checkedDecisions });
   const checkedAliases = validateAliases(aliases);
   if (typeof checkedAliases === 'string')
     return res.status(400).json({ error: checkedAliases });
@@ -125,7 +212,8 @@ app.put('/api/job', (req, res) => {
     jobId: previous?.jobId ?? randomUUID(),
     vtt,
     rules: checked,
-    revertedKeys: revertedKeys.filter((k) => typeof k === 'string'),
+    hitExceptions: exceptions,
+    entityDecisions: checkedDecisions,
     aliases: checkedAliases,
     updatedAt: new Date().toISOString(),
   };

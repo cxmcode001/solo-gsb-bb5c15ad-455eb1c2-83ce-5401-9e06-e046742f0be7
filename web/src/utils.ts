@@ -1,4 +1,4 @@
-import type { MaskRule } from './types';
+import type { EntityDecision, Hit, HitException, MaskRule } from './types';
 
 export function uid(prefix = 'rule'): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -40,4 +40,41 @@ export function stamp(): string {
   const d = new Date();
   const p = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+/* ---------------- 逐条例外 / 实体决定 ---------------- */
+
+export type FinalState = 'applied' | 'reverted';
+
+/**
+ * 命中在不考虑逐条例外时的继承状态：
+ * 有实体决定则按决定（keep → 保留原文），否则默认应用。
+ */
+export function inheritedState(
+  hit: Pick<Hit, 'ruleId' | 'entityKey'>,
+  decisions: EntityDecision[],
+): FinalState {
+  const d = decisions.find(
+    (x) => x.ruleId === hit.ruleId && x.entityKey === hit.entityKey,
+  );
+  if (!d) return 'applied';
+  return d.action === 'keep' ? 'reverted' : 'applied';
+}
+
+/**
+ * 把一组命中写向目标状态：
+ * - 目标与继承状态不同 → 写入显式例外（优先于实体决定）；
+ * - 目标与继承状态相同 → 清除已有例外（恢复继承，不产生冗余例外）。
+ */
+export function withExceptionTarget(
+  exceptions: HitException[],
+  entries: { key: string; inherited: FinalState }[],
+  target: FinalState,
+): HitException[] {
+  const map = new Map<string, FinalState>(exceptions.map((e) => [e.key, e.state]));
+  for (const { key, inherited } of entries) {
+    if (target === inherited) map.delete(key);
+    else map.set(key, target);
+  }
+  return Array.from(map, ([key, state]) => ({ key, state }));
 }
