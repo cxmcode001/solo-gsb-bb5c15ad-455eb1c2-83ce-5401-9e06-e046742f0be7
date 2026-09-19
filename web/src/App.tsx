@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from './api';
 import type {
   AliasEntry,
+  EntityDecision,
   ExportResult,
   MaskRule,
   Preset,
@@ -12,6 +13,7 @@ import { SAMPLE_VTT } from './sample';
 import { VttInput } from './components/VttInput';
 import { RulesPanel } from './components/RulesPanel';
 import { AliasPanel } from './components/AliasPanel';
+import { DecisionPanel } from './components/DecisionPanel';
 import { Preview } from './components/Preview';
 import { ExportModal } from './components/ExportModal';
 
@@ -20,7 +22,12 @@ type SaveState = 'idle' | 'saving' | 'saved' | 'error';
 export default function App() {
   const [vtt, setVtt] = useState('');
   const [rules, setRules] = useState<MaskRule[]>([]);
+  /** 逐条「撤销」例外（优先于实体决定） */
   const [revertedKeys, setRevertedKeys] = useState<string[]>([]);
+  /** 逐条「应用」例外（实体决定为保留时的例外） */
+  const [appliedKeys, setAppliedKeys] = useState<string[]>([]);
+  /** 实体决定：始终应用 / 始终保留（持久化，新命中自动继承） */
+  const [entityDecisions, setEntityDecisions] = useState<EntityDecision[]>([]);
   const [aliases, setAliases] = useState<AliasEntry[]>([]);
   const [presets, setPresets] = useState<Preset[]>([]);
   const [preview, setPreview] = useState<PreviewResult | null>(null);
@@ -52,6 +59,8 @@ export default function App() {
           setVtt(job.vtt);
           setRules(job.rules.map(normalizeRule));
           setRevertedKeys(job.revertedKeys ?? []);
+          setAppliedKeys(job.appliedKeys ?? []);
+          setEntityDecisions(job.entityDecisions ?? []);
           setAliases(job.aliases ?? []);
           setUpdatedAt(job.updatedAt);
         } else {
@@ -81,7 +90,14 @@ export default function App() {
     const reqId = ++previewReq.current;
     previewTimer.current = setTimeout(async () => {
       try {
-        const p = await api.preview(vtt, rules, revertedKeys, aliases);
+        const p = await api.preview({
+          vtt,
+          rules,
+          revertedKeys,
+          appliedKeys,
+          entityDecisions,
+          aliases,
+        });
         // 过期响应（用户已继续编辑 / 改名）直接丢弃
         if (reqId !== previewReq.current) return;
         setPreview(p);
@@ -100,7 +116,7 @@ export default function App() {
     return () => {
       if (previewTimer.current) clearTimeout(previewTimer.current);
     };
-  }, [vtt, rules, revertedKeys, aliases, hydrated]);
+  }, [vtt, rules, revertedKeys, appliedKeys, entityDecisions, aliases, hydrated]);
 
   /* ------------- 防抖自动保存（800ms），刷新可恢复 ------------- */
   useEffect(() => {
@@ -109,7 +125,14 @@ export default function App() {
     setSaveState('saving');
     saveTimer.current = setTimeout(async () => {
       try {
-        const { job } = await api.saveJob(vtt, rules, revertedKeys, aliases);
+        const { job } = await api.saveJob({
+          vtt,
+          rules,
+          revertedKeys,
+          appliedKeys,
+          entityDecisions,
+          aliases,
+        });
         setUpdatedAt(job.updatedAt);
         setSaveState('saved');
       } catch {
@@ -119,26 +142,95 @@ export default function App() {
     return () => {
       if (saveTimer.current) clearTimeout(saveTimer.current);
     };
-  }, [vtt, rules, revertedKeys, aliases, hydrated]);
+  }, [vtt, rules, revertedKeys, appliedKeys, entityDecisions, aliases, hydrated]);
 
-  /* ------------- 撤销 / 应用 ------------- */
-  const toggleHit = useCallback((key: string) => {
-    setRevertedKeys((keys) =>
-      keys.includes(key) ? keys.filter((k) => k !== key) : [...keys, key],
-    );
-  }, []);
+  /* ------------- 逐条例外（优先于实体决定） ------------- */
+  const hitByKey = useCallback(
+    (key: string) => preview?.cues.flatMap((c) => c.hits).find((h) => h.key === key),
+    [preview],
+  );
+
+  /**
+   * 逐条切换：
+   *  - 已是例外的命中 → 清除例外，恢复继承实体决定 / 默认
+   *  - 否则记录与当前状态相反的显式例外（撤销 ↔ 应用）
+   */
+  const toggleHit = useCallback(
+    (key: string) => {
+      const hit = hitByKey(key);
+      if (hit && hit.decisionSource === 'hit-exception') {
+        setRevertedKeys((ks) => ks.filter((k) => k !== key));
+        setAppliedKeys((ks) => ks.filter((k) => k !== key));
+      } else if (hit?.reverted) {
+        setAppliedKeys((ks) => (ks.includes(key) ? ks : [...ks, key]));
+        setRevertedKeys((ks) => ks.filter((k) => k !== key));
+      } else {
+        setRevertedKeys((ks) => (ks.includes(key) ? ks : [...ks, key]));
+        setAppliedKeys((ks) => ks.filter((k) => k !== key));
+      }
+    },
+    [hitByKey],
+  );
+
+  /** 全部撤销：为每个当前命中记录撤销例外（显式例外优先于实体决定） */
   const revertAll = useCallback(() => {
     if (!preview) return;
+    setAppliedKeys([]);
     setRevertedKeys(preview.cues.flatMap((c) => c.hits.map((h) => h.key)));
   }, [preview]);
-  const applyAll = useCallback(() => setRevertedKeys([]), []);
 
-  /* 规则变更后，清除已不存在的撤销项（key 由 cue 序号+区间+规则决定，天然稳定） */
+  /** 全部应用：清除撤销例外；「始终保留」实体的命中补应用例外，保证全部应用 */
+  const applyAll = useCallback(() => {
+    if (!preview) return;
+    const keepEntities = new Set(
+      entityDecisions
+        .filter((d) => d.action === 'keep')
+        .map((d) => `${d.ruleId} ${d.entityKey}`),
+    );
+    const needApplyException = preview.cues
+      .flatMap((c) => c.hits)
+      .filter((h) => keepEntities.has(`${h.ruleId} ${h.entityKey}`))
+      .map((h) => h.key);
+    setRevertedKeys([]);
+    setAppliedKeys(needApplyException);
+  }, [preview, entityDecisions]);
+
+  /* 规则 / 文本变化后，清除已不存在命中的例外（key 由 cue 序号+区间+规则决定，天然稳定） */
   useEffect(() => {
     if (!preview) return;
     const valid = new Set(preview.cues.flatMap((c) => c.hits.map((h) => h.key)));
     setRevertedKeys((keys) => keys.filter((k) => valid.has(k)));
+    setAppliedKeys((keys) => keys.filter((k) => valid.has(k)));
   }, [preview]);
+
+  /* ------------- 实体决定 ------------- */
+  const setEntityDecision = useCallback(
+    (ruleId: string, entityKey: string, action: 'apply' | 'keep' | null) => {
+      setEntityDecisions((list) => {
+        const rest = list.filter(
+          (d) => !(d.ruleId === ruleId && d.entityKey === entityKey),
+        );
+        return action ? [...rest, { ruleId, entityKey, action }] : rest;
+      });
+    },
+    [],
+  );
+
+  /** 清除某实体全部当前命中的逐条例外，恢复继承实体决定 */
+  const clearEntityExceptions = useCallback(
+    (ruleId: string, entityKey: string) => {
+      if (!preview) return;
+      const keys = new Set(
+        preview.cues
+          .flatMap((c) => c.hits)
+          .filter((h) => h.ruleId === ruleId && h.entityKey === entityKey)
+          .map((h) => h.key),
+      );
+      setRevertedKeys((ks) => ks.filter((k) => !keys.has(k)));
+      setAppliedKeys((ks) => ks.filter((k) => !keys.has(k)));
+    },
+    [preview],
+  );
 
   /* ------------- 化名表手动改名 / 恢复自动 ------------- */
   const renameAlias = useCallback((ruleId: string, entityKey: string, alias: string) => {
@@ -160,11 +252,18 @@ export default function App() {
     );
   }, []);
 
-  /* ------------- 导出 ------------- */
+  /* ------------- 导出（与预览同一最终状态） ------------- */
   const doExport = async () => {
     if (!vtt.trim()) return;
     try {
-      const result = await api.export(vtt, rules, revertedKeys, aliases);
+      const result = await api.export({
+        vtt,
+        rules,
+        revertedKeys,
+        appliedKeys,
+        entityDecisions,
+        aliases,
+      });
       setExportData(result);
     } catch (e) {
       setError(`导出失败：${(e as Error).message}`);
@@ -185,7 +284,7 @@ export default function App() {
           <span className="logo">🛡</span>
           <div>
             <h1>字幕脱敏审校台</h1>
-            <p>WebVTT 本机正则脱敏 · 优先级合并 · 逐条撤销 · 稳定化名 · 审计导出</p>
+            <p>WebVTT 本机正则脱敏 · 优先级合并 · 实体决策 · 逐条例外 · 稳定化名 · 审计导出</p>
           </div>
         </div>
         <div className="topbar-right">
@@ -221,6 +320,11 @@ export default function App() {
           />
         </div>
         <div className="col col-right">
+          <DecisionPanel
+            entities={preview?.entities ?? []}
+            onSetDecision={setEntityDecision}
+            onClearExceptions={clearEntityExceptions}
+          />
           <Preview
             preview={preview}
             loading={loading}

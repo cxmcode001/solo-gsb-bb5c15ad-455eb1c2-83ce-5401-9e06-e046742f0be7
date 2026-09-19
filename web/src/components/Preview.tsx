@@ -23,6 +23,33 @@ function segments(cue: CueHit): { text: string; hit?: Hit }[] {
   return out;
 }
 
+/** 决策来源标记（实体决定 / 逐条例外） */
+function sourceBadge(hit: Hit): { cls: string; label: string } | null {
+  switch (hit.decisionSource) {
+    case 'entity-apply':
+      return { cls: 'src-entity-apply', label: '实体·应用' };
+    case 'entity-keep':
+      return { cls: 'src-entity-keep', label: '实体·保留' };
+    case 'hit-exception':
+      return { cls: 'src-exception', label: '例外' };
+    default:
+      return null;
+  }
+}
+
+function sourceTitle(hit: Hit): string {
+  switch (hit.decisionSource) {
+    case 'entity-apply':
+      return '来源：实体决定「始终应用」';
+    case 'entity-keep':
+      return '来源：实体决定「始终保留」';
+    case 'hit-exception':
+      return '来源：逐条显式例外（优先于实体决定）';
+    default:
+      return '来源：默认（无实体决定）';
+  }
+}
+
 function CueCard({ cue, onToggleHit }: { cue: CueHit; onToggleHit: (k: string) => void }) {
   const segs = useMemo(() => segments(cue), [cue]);
   return (
@@ -41,9 +68,10 @@ function CueCard({ cue, onToggleHit }: { cue: CueHit; onToggleHit: (k: string) =
                 s.hit.alias !== undefined ? 'hit-alias' : ''
               }`}
               title={
-                s.hit.alias !== undefined
+                (s.hit.alias !== undefined
                   ? `${s.hit.ruleName}（稳定化名，优先级 ${s.hit.priority}）\n原文：${s.hit.match}\n实体键：${s.hit.entityKey}\n化名：${s.hit.alias}`
-                  : `${s.hit.ruleName}（优先级 ${s.hit.priority}）\n原文：${s.hit.match}\n替换：${s.hit.replacement}`
+                  : `${s.hit.ruleName}（优先级 ${s.hit.priority}）\n原文：${s.hit.match}\n实体键：${s.hit.entityKey}\n替换：${s.hit.replacement}`) +
+                `\n${sourceTitle(s.hit)}`
               }
             >
               <span className="hit-label">{s.hit.ruleName}</span>
@@ -52,12 +80,27 @@ function CueCard({ cue, onToggleHit }: { cue: CueHit; onToggleHit: (k: string) =
               ) : (
                 <span className="hit-replacement">{s.hit.replacement}</span>
               )}
+              {sourceBadge(s.hit) && (
+                <span className={`hit-src ${sourceBadge(s.hit)!.cls}`}>
+                  {sourceBadge(s.hit)!.label}
+                </span>
+              )}
               <button
                 className="hit-toggle"
                 onClick={() => onToggleHit(s.hit!.key)}
-                title={s.hit.reverted ? '重新应用此替换' : '撤销此替换（恢复原文）'}
+                title={
+                  s.hit.decisionSource === 'hit-exception'
+                    ? '清除此命中的逐条例外，恢复继承实体决定 / 默认'
+                    : s.hit.reverted
+                      ? '应用此替换（作为逐条例外，优先于实体决定）'
+                      : '撤销此替换（作为逐条例外，优先于实体决定）'
+                }
               >
-                {s.hit.reverted ? '↩ 应用' : '↶ 撤销'}
+                {s.hit.decisionSource === 'hit-exception'
+                  ? '✕ 例外'
+                  : s.hit.reverted
+                    ? '↩ 应用'
+                    : '↶ 撤销'}
               </button>
             </span>
           ) : (
@@ -100,10 +143,20 @@ export function Preview({ preview, loading, onToggleHit, onRevertAll, onApplyAll
             />
             仅看命中
           </label>
-          <button className="btn btn-ghost" onClick={onApplyAll} disabled={!preview}>
+          <button
+            className="btn btn-ghost"
+            onClick={onApplyAll}
+            disabled={!preview}
+            title="应用全部命中：清除撤销例外，并为「始终保留」实体的命中补应用例外"
+          >
             全部应用
           </button>
-          <button className="btn btn-ghost" onClick={onRevertAll} disabled={!preview}>
+          <button
+            className="btn btn-ghost"
+            onClick={onRevertAll}
+            disabled={!preview}
+            title="撤销全部命中：为每个命中记录逐条撤销例外（优先于实体决定）"
+          >
             全部撤销
           </button>
         </div>
@@ -123,6 +176,9 @@ export function Preview({ preview, loading, onToggleHit, onRevertAll, onApplyAll
           <span className="stat-applied">将脱敏 {preview.appliedHits}</span>
           <span className="stat-reverted">已撤销 {preview.revertedHits}</span>
           <span className="stat-suppressed">重叠抑制 {preview.suppressedHits}</span>
+          {preview.exceptionHits > 0 && (
+            <span className="stat-exception">逐条例外 {preview.exceptionHits}</span>
+          )}
         </div>
       )}
 

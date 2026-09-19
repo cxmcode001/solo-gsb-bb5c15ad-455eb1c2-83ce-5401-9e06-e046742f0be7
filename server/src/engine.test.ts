@@ -270,4 +270,201 @@ test('稳定化名：与模板规则并存，优先级抑制照常', () => {
   assert.ok(firstCue.suppressed.some((s) => s.ruleName === '姓名-稳定化名' && s.entityKey === '张伟'));
 });
 
+/* ---------------------------- 实体决策 ---------------------------- */
+
+const NUM_RULE: MaskRule = {
+  id: 'num',
+  name: '长号码',
+  pattern: '(?<!\\d)1[3-9]\\d{9}(?!\\d)',
+  flags: 'g',
+  replacement: '$MASKALL',
+  priority: 50,
+  enabled: true,
+  mode: 'template',
+  aliasPrefix: '',
+};
+
+const NUM_VTT = `WEBVTT
+
+00:00:00.000 --> 00:00:02.000
+联系电话 13812345678 备用。
+
+00:00:02.500 --> 00:00:05.000
+还是 13812345678，或 13900001111。
+
+00:00:05.500 --> 00:00:08.000
+最后确认 13812345678。
+`;
+
+/** 实体决定「始终保留」：同实体全部保留，新出现的同实体命中自动继承 */
+test('实体决策：始终保留作用于全部同实体命中，新命中自动继承', () => {
+  const decisions = [{ ruleId: 'num', entityKey: '13812345678', action: 'keep' as const }];
+  const v = buildPreview({ vtt: NUM_VTT, rules: [NUM_RULE], entityDecisions: decisions });
+  const all = v.cues.flatMap((c) => c.hits);
+  const kept = all.filter((h) => h.match === '13812345678');
+  assert.strictEqual(kept.length, 3);
+  for (const h of kept) {
+    assert.strictEqual(h.reverted, true);
+    assert.strictEqual(h.decisionSource, 'entity-keep');
+  }
+  const other = all.find((h) => h.match === '13900001111')!;
+  assert.strictEqual(other.reverted, false);
+  assert.strictEqual(other.decisionSource, 'default');
+  assert.strictEqual(v.revertedHits, 3);
+  assert.strictEqual(v.appliedHits, 1);
+
+  // 实体列表：决定与计数
+  const e138 = v.entities.find((e) => e.entityKey === '13812345678')!;
+  assert.strictEqual(e138.decision, 'keep');
+  assert.strictEqual(e138.totalHits, 3);
+  assert.strictEqual(e138.revertedHits, 3);
+  const e139 = v.entities.find((e) => e.entityKey === '13900001111')!;
+  assert.strictEqual(e139.decision, null);
+  assert.strictEqual(e139.appliedHits, 1);
+
+  // 新增含同实体的 cue：自动继承保留决定
+  const extended = NUM_VTT + '\n00:00:09.000 --> 00:00:11.000\n补充 13812345678  again。\n';
+  const v2 = buildPreview({ vtt: extended, rules: [NUM_RULE], entityDecisions: decisions });
+  const inherited = v2.cues.flatMap((c) => c.hits).filter((h) => h.match === '13812345678');
+  assert.strictEqual(inherited.length, 4);
+  assert.ok(inherited.every((h) => h.reverted && h.decisionSource === 'entity-keep'));
+
+  // 导出与预览同一最终状态：保留原文，审计记录决策来源
+  const ex = exportResult({ vtt: NUM_VTT, rules: [NUM_RULE], entityDecisions: decisions });
+  assert.ok(ex.vtt.includes('13812345678'), '保留实体应保持原文');
+  assert.ok(!ex.vtt.includes('13900001111'), '未决定实体应脱敏');
+  assert.strictEqual(ex.audit.stats.revertedHits, 3);
+  assert.strictEqual(ex.audit.stats.appliedHits, 1);
+  const recs = ex.audit.records.filter((r) => r.source.text === '13812345678');
+  assert.ok(recs.every((r) => r.status === 'reverted' && r.decisionSource === 'entity-keep'));
+  assert.deepStrictEqual(ex.audit.entityDecisions, decisions);
+});
+
+/** 实体决定「始终应用」+ 逐条撤销例外：例外优先，清除例外恢复继承 */
+test('实体决策：逐条撤销例外优先于始终应用，清除后恢复继承', () => {
+  const decisions = [{ ruleId: 'num', entityKey: '13812345678', action: 'apply' as const }];
+  const v1 = buildPreview({ vtt: NUM_VTT, rules: [NUM_RULE], entityDecisions: decisions });
+  const first = v1.cues[0].hits.find((h) => h.match === '13812345678')!;
+  assert.strictEqual(first.decisionSource, 'entity-apply');
+
+  // 逐条撤销 = 显式例外，优先于实体决定
+  const v2 = buildPreview({
+    vtt: NUM_VTT,
+    rules: [NUM_RULE],
+    entityDecisions: decisions,
+    revertedKeys: [first.key],
+  });
+  const hit2 = v2.cues[0].hits.find((h) => h.key === first.key)!;
+  assert.strictEqual(hit2.reverted, true);
+  assert.strictEqual(hit2.decisionSource, 'hit-exception');
+  assert.strictEqual(v2.exceptionHits, 1);
+  // 同实体其余命中仍继承「始终应用」
+  const others = v2.cues.flatMap((c) => c.hits).filter((h) => h.match === '13812345678' && h.key !== first.key);
+  assert.ok(others.every((h) => !h.reverted && h.decisionSource === 'entity-apply'));
+  // 实体列表反映例外计数
+  const e138 = v2.entities.find((e) => e.entityKey === '13812345678')!;
+  assert.strictEqual(e138.exceptionHits, 1);
+
+  // 清除例外（不再传 revertedKeys）→ 恢复继承实体决定
+  const v3 = buildPreview({ vtt: NUM_VTT, rules: [NUM_RULE], entityDecisions: decisions });
+  assert.ok(v3.cues.flatMap((c) => c.hits).every((h) => !h.reverted));
+  assert.strictEqual(v3.exceptionHits, 0);
+});
+
+/** 实体决定「始终保留」+ 逐条应用例外：例外优先，导出一致 */
+test('实体决策：逐条应用例外覆盖始终保留，导出与审计一致', () => {
+  const decisions = [{ ruleId: 'num', entityKey: '13812345678', action: 'keep' as const }];
+  const v1 = buildPreview({ vtt: NUM_VTT, rules: [NUM_RULE], entityDecisions: decisions });
+  const target = v1.cues[1].hits.find((h) => h.match === '13812345678')!;
+
+  const input = {
+    vtt: NUM_VTT,
+    rules: [NUM_RULE],
+    entityDecisions: decisions,
+    appliedKeys: [target.key],
+  };
+  const v2 = buildPreview(input);
+  const hit = v2.cues[1].hits.find((h) => h.key === target.key)!;
+  assert.strictEqual(hit.reverted, false);
+  assert.strictEqual(hit.decisionSource, 'hit-exception');
+  assert.strictEqual(v2.appliedHits, 2); // 例外 + 13900001111
+  assert.strictEqual(v2.revertedHits, 2);
+
+  const ex = exportResult(input);
+  const rec = ex.audit.records.find((r) => r.source.start === target.start && r.cueIndex === 1)!;
+  assert.strictEqual(rec.status, 'applied');
+  assert.strictEqual(rec.decisionSource, 'hit-exception');
+  assert.strictEqual(ex.audit.stats.exceptionHits, 1);
+  // 该处替换为打码，其余同实体保留原文
+  assert.ok(ex.vtt.includes('***********'), '例外处应应用替换');
+  assert.ok(ex.vtt.includes('13812345678'), '其余同实体命中仍保留原文');
+});
+
+/** 实体键 NFKC 归一：全角数字命中继承半角实体的决定 */
+test('实体决策：NFKC 归一后跨全半角继承同一决定', () => {
+  const fullWidth = NUM_VTT.replace(/13812345678/g, '１３８１２３４５６７８');
+  const wideRule: MaskRule = { ...NUM_RULE, pattern: '(?<!\\d)[0-9０-９]{11}(?!\\d)' };
+  const decisions = [{ ruleId: 'num', entityKey: '13812345678', action: 'keep' as const }];
+  const v = buildPreview({ vtt: fullWidth, rules: [wideRule], entityDecisions: decisions });
+  const hits = v.cues.flatMap((c) => c.hits).filter((h) => h.entityKey === '13812345678');
+  assert.strictEqual(hits.length, 3);
+  assert.ok(hits.every((h) => h.reverted && h.decisionSource === 'entity-keep'));
+});
+
+/** 重叠合并后只对胜出命中生效：被抑制项不继承决定、不生成例外 */
+test('实体决策：重叠抑制项不受决定影响且不生成例外', () => {
+  const rules = [presetRule('身份证'), presetRule('银行卡')];
+  // 对银行卡实体（18 位重叠数字）设「始终应用」，对身份证实体设「始终保留」
+  const decisions = [
+    { ruleId: 'r-银行卡', entityKey: '110101199003071234', action: 'apply' as const },
+    { ruleId: 'r-身份证', entityKey: '110101199003071234', action: 'keep' as const },
+  ];
+  const v = buildPreview({ vtt: SAMPLE_VTT, rules, entityDecisions: decisions });
+  const idCue = v.cues.find((c) => c.text.includes('110101'))!;
+  // 胜出的身份证命中继承「始终保留」
+  const winner = idCue.hits.find((h) => h.ruleName === '身份证')!;
+  assert.strictEqual(winner.reverted, true);
+  assert.strictEqual(winner.decisionSource, 'entity-keep');
+  // 被抑制的银行卡命中仍是 suppressed，决定不生效、不产生例外
+  const sup = idCue.suppressed.find((s) => s.ruleName === '银行卡')!;
+  assert.strictEqual(sup.entityKey, '110101199003071234');
+  assert.strictEqual(v.exceptionHits, 0);
+  const bankEntity = v.entities.find((e) => e.ruleId === 'r-银行卡' && e.entityKey === '110101199003071234');
+  assert.ok(!bankEntity || bankEntity.totalHits === 0, '被抑制命中不计入实体命中数');
+
+  const ex = exportResult({ vtt: SAMPLE_VTT, rules, entityDecisions: decisions });
+  const supRec = ex.audit.records.find((r) => r.status === 'suppressed' && r.rule.name === '银行卡')!;
+  assert.strictEqual(supRec.decisionSource, 'overlap');
+  const winRec = ex.audit.records.find((r) => r.rule.name === '身份证')!;
+  assert.strictEqual(winRec.status, 'reverted');
+  assert.strictEqual(winRec.decisionSource, 'entity-keep');
+});
+
+/** 已持久决定但当前无命中的实体：保留在决策列表中（0 命中） */
+test('实体决策：无命中实体的决定持久可见，规则删除后标记', () => {
+  const decisions = [
+    { ruleId: 'num', entityKey: '13812345678', action: 'keep' as const },
+    { ruleId: 'gone', entityKey: '不存在实体', action: 'apply' as const },
+  ];
+  const v = buildPreview({ vtt: NUM_VTT, rules: [NUM_RULE], entityDecisions: decisions });
+  const ghost = v.entities.find((e) => e.entityKey === '不存在实体')!;
+  assert.strictEqual(ghost.decision, 'apply');
+  assert.strictEqual(ghost.totalHits, 0);
+  assert.strictEqual(ghost.ruleName, '已删除规则');
+});
+
+/** 同一实体重复决定：后写覆盖先写（保存 / 预览 / 导出一致） */
+test('实体决策：同实体决定去重，后写覆盖', () => {
+  const decisions = [
+    { ruleId: 'num', entityKey: '13812345678', action: 'keep' as const },
+    { ruleId: 'num', entityKey: '13812345678', action: 'apply' as const },
+  ];
+  const v = buildPreview({ vtt: NUM_VTT, rules: [NUM_RULE], entityDecisions: decisions });
+  const hits = v.cues.flatMap((c) => c.hits).filter((h) => h.match === '13812345678');
+  assert.ok(hits.every((h) => !h.reverted && h.decisionSource === 'entity-apply'));
+  const ex = exportResult({ vtt: NUM_VTT, rules: [NUM_RULE], entityDecisions: decisions });
+  assert.strictEqual(ex.audit.entityDecisions!.length, 1);
+  assert.strictEqual(ex.audit.entityDecisions![0].action, 'apply');
+});
+
 console.log(`\n引擎自测全部通过（${passed} 项）`);

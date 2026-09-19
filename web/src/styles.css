@@ -594,6 +594,171 @@ select:focus {
   padding: 1px 6px;
 }
 
+/* ---------------- 实体决策 ---------------- */
+.decision-tabs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.decision-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--border);
+  background: #fff;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.decision-tab:hover {
+  border-color: #94a3b8;
+}
+.decision-tab.active {
+  border-color: var(--primary);
+  color: var(--primary-dark);
+  background: #eff6ff;
+  font-weight: 600;
+}
+.decision-count {
+  background: #e2e8f0;
+  color: #475569;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 0 6px;
+  line-height: 16px;
+}
+.decision-tab.active .decision-count {
+  background: var(--primary);
+  color: #fff;
+}
+
+.decision-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.decision-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: #fcfdff;
+  font-size: 12.5px;
+}
+.decision-item.decision-apply {
+  border-color: var(--applied-border);
+  background: var(--applied-bg);
+}
+.decision-item.decision-keep {
+  border-color: var(--reverted-border);
+  background: var(--reverted-bg);
+}
+.decision-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+  flex-wrap: wrap;
+}
+.decision-rule {
+  color: var(--muted);
+  font-size: 11.5px;
+  background: #f1f5f9;
+  border-radius: 4px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+.decision-entity {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+.decision-stats {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.decision-exc {
+  color: var(--primary-dark);
+  font-style: normal;
+  font-weight: 700;
+}
+.decision-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.decision-switch {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: #fff;
+}
+.switch-opt {
+  border: none;
+  background: none;
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.switch-opt + .switch-opt {
+  border-left: 1px solid var(--border);
+}
+.switch-opt:hover {
+  background: #f8fafc;
+}
+.switch-opt.active {
+  font-weight: 700;
+  color: #fff;
+  background: #94a3b8;
+}
+.switch-opt.switch-apply.active {
+  background: var(--applied);
+}
+.switch-opt.switch-keep.active {
+  background: var(--reverted);
+}
+
+/* 命中片段上的决策来源标记 */
+.hit-src {
+  font-size: 9.5px;
+  font-weight: 700;
+  border-radius: 4px;
+  padding: 0 4px;
+  line-height: 14px;
+}
+.src-entity-apply {
+  background: var(--applied);
+  color: #fff;
+}
+.src-entity-keep {
+  background: var(--reverted);
+  color: #fff;
+}
+.src-exception {
+  background: var(--primary);
+  color: #fff;
+}
+.stat-exception {
+  color: var(--primary-dark);
+  font-weight: 600;
+}
+
 /* ---------------- 横幅 / 弹层 ---------------- */
 .banner {
   background: #fffbeb;

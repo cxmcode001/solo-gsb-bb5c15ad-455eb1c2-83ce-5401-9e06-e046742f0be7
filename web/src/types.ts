@@ -1,5 +1,21 @@
 export type RuleMode = 'template' | 'alias';
 
+/** 实体决定：对「规则 + NFKC 归一实体」的一次性裁决（持久化，新命中自动继承） */
+export interface EntityDecision {
+  ruleId: string;
+  entityKey: string;
+  /** apply = 始终应用；keep = 始终保留 */
+  action: 'apply' | 'keep';
+}
+
+/** 命中最终状态的决策来源 */
+export type DecisionSource =
+  | 'default'
+  | 'entity-apply'
+  | 'entity-keep'
+  | 'hit-exception'
+  | 'overlap';
+
 export interface MaskRule {
   id: string;
   name: string;
@@ -34,8 +50,11 @@ export interface Hit {
   match: string;
   replacement: string;
   reverted: boolean;
+  /** 实体键：NFKC + trim 后的原文（所有规则都计算） */
   entityKey?: string;
   alias?: string;
+  /** 最终状态的决策来源 */
+  decisionSource: DecisionSource;
 }
 
 export interface SuppressedHit {
@@ -69,9 +88,27 @@ export interface PreviewResult {
   appliedHits: number;
   revertedHits: number;
   suppressedHits: number;
+  /** 逐条显式例外总数 */
+  exceptionHits: number;
   cues: CueHit[];
   parseErrors: string[];
   aliases: AliasEntry[];
+  /** 实体决策列表（当前命中实体 + 已持久决定的实体） */
+  entities: EntitySummary[];
+}
+
+/** 实体决策列表条目：按「规则 + 实体键」聚合 */
+export interface EntitySummary {
+  ruleId: string;
+  ruleName: string;
+  entityKey: string;
+  sample: string;
+  totalHits: number;
+  appliedHits: number;
+  revertedHits: number;
+  exceptionHits: number;
+  /** 当前实体决定；null = 待定 */
+  decision: 'apply' | 'keep' | null;
 }
 
 export interface JobState {
@@ -79,6 +116,8 @@ export interface JobState {
   vtt: string;
   rules: MaskRule[];
   revertedKeys: string[];
+  appliedKeys: string[];
+  entityDecisions: EntityDecision[];
   aliases: AliasEntry[];
   updatedAt: string;
 }
@@ -91,6 +130,8 @@ export interface AuditRecord {
   source: { start: number; end: number; text: string };
   replacement: string;
   status: 'applied' | 'reverted' | 'suppressed';
+  /** 最终状态的决策来源 */
+  decisionSource: DecisionSource;
   suppressedBy?: { id: string; name: string };
   entityKey?: string;
   alias?: string;
@@ -107,9 +148,11 @@ export interface AuditReport {
     appliedHits: number;
     revertedHits: number;
     suppressedHits: number;
+    exceptionHits: number;
   };
   records: AuditRecord[];
   aliases?: AliasEntry[];
+  entityDecisions?: EntityDecision[];
 }
 
 export interface ExportResult {

@@ -1,6 +1,7 @@
 import type {
   AliasEntry,
   AuditReport,
+  EntityDecision,
   ExportResult,
   JobState,
   MaskRule,
@@ -26,34 +27,34 @@ async function req<T>(url: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/** 预览 / 导出 / 保存共用的任务载荷，保证三处最终状态一致 */
+interface JobPayload {
+  vtt: string;
+  rules: MaskRule[];
+  revertedKeys: string[];
+  appliedKeys: string[];
+  entityDecisions: EntityDecision[];
+  aliases: AliasEntry[];
+}
+
 export const api = {
   presets: () => req<{ presets: Preset[] }>('/api/presets'),
   getJob: () => req<{ job: JobState | null }>('/api/job'),
-  saveJob: (vtt: string, rules: MaskRule[], revertedKeys: string[], aliases: AliasEntry[]) =>
+  saveJob: (p: JobPayload) =>
     req<{ job: JobState }>('/api/job', {
       method: 'PUT',
-      body: JSON.stringify({ vtt, rules, revertedKeys, aliases }),
+      body: JSON.stringify(p),
     }),
-  preview: (
-    vtt: string,
-    rules: MaskRule[],
-    revertedKeys: string[],
-    aliases: AliasEntry[],
-  ) =>
+  preview: (p: JobPayload) =>
     req<PreviewResult>('/api/preview', {
       method: 'POST',
-      body: JSON.stringify({ vtt, rules, revertedKeys, aliases }),
+      body: JSON.stringify(p),
     }),
-  export: (
-    vtt: string,
-    rules: MaskRule[],
-    revertedKeys: string[],
-    aliases: AliasEntry[],
-  ) =>
+  export: (p: JobPayload) =>
     req<ExportResult>('/api/export', {
       method: 'POST',
-      body: JSON.stringify({ vtt, rules, revertedKeys, aliases }),
+      body: JSON.stringify(p),
     }),
 };
 
-export type { AliasEntry, AuditReport };
+export type { AliasEntry, AuditReport, JobPayload };

@@ -5,6 +5,9 @@ import type {
   AuditRecord,
   AuditReport,
   CueHit,
+  DecisionSource,
+  EntityDecision,
+  EntitySummary,
   ExportResult,
   Hit,
   MaskRule,
@@ -47,6 +50,32 @@ export function normalizeEntity(raw: string): string {
 
 export function aliasMapKey(ruleId: string, entityKey: string): string {
   return `${ruleId} ${entityKey}`;
+}
+
+/** 实体决定的查找键：规则 id + 实体键（与化名表同一命名空间） */
+export function decisionMapKey(ruleId: string, entityKey: string): string {
+  return `${ruleId} ${entityKey}`;
+}
+
+/**
+ * 规整实体决定列表：过滤非法项，按「规则 + 实体键」去重（后写覆盖先写）。
+ * 供预览 / 导出 / 保存共用，保证三处最终状态一致。
+ */
+export function normalizeDecisions(
+  decisions: EntityDecision[] | undefined,
+): EntityDecision[] {
+  const map = new Map<string, EntityDecision>();
+  for (const d of decisions ?? []) {
+    if (!d || typeof d.ruleId !== 'string' || !d.ruleId) continue;
+    if (typeof d.entityKey !== 'string' || !d.entityKey) continue;
+    if (d.action !== 'apply' && d.action !== 'keep') continue;
+    map.set(decisionMapKey(d.ruleId, d.entityKey), {
+      ruleId: d.ruleId,
+      entityKey: d.entityKey,
+      action: d.action,
+    });
+  }
+  return Array.from(map.values());
 }
 
 export interface CompiledRule {
@@ -179,8 +208,8 @@ interface RawHit {
   end: number; // 不含
   match: string;
   replacement: string;
-  /** 化名规则的实体键；模板规则为 undefined */
-  entityKey?: string;
+  /** 实体键（NFKC + trim）；所有规则都计算，实体决定据此继承 */
+  entityKey: string;
 }
 
 function hitKey(cueIndex: number, start: string, h: RawHit): string {
@@ -228,6 +257,8 @@ export function buildPreview(input: {
   vtt: string;
   rules: MaskRule[];
   revertedKeys?: string[];
+  appliedKeys?: string[];
+  entityDecisions?: EntityDecision[];
   aliases?: AliasEntry[];
 }): PreviewResult {
   const parsed = parseVtt(input.vtt);
@@ -236,7 +267,14 @@ export function buildPreview(input: {
   for (const e of errors) parsed.errors.push(`规则 ${e.ruleId} 正则无效：${e.message}`);
 
   const ruleById = new Map(normalizedRules.map((r) => [r.id, r]));
-  const reverted = new Set(input.revertedKeys ?? []);
+  /* 逐条显式例外：撤销例外 / 应用例外，均优先于实体决定 */
+  const revertExceptions = new Set(input.revertedKeys ?? []);
+  const applyExceptions = new Set(input.appliedKeys ?? []);
+  /* 实体决定：规则 + NFKC 实体键 → 始终应用 / 始终保留 */
+  const decisions = normalizeDecisions(input.entityDecisions);
+  const decisionByEntity = new Map(
+    decisions.map((d) => [decisionMapKey(d.ruleId, d.entityKey), d.action]),
+  );
 
   /* ---------- 化名状态：载入已持久映射，序号只增不复用 ---------- */
   const aliases: AliasEntry[] = (input.aliases ?? []).map((a) => ({ ...a }));
@@ -276,7 +314,8 @@ export function buildPreview(input: {
           end: m.index + matched.length,
           match: matched,
           replacement: isAlias ? '' : applyTemplate(rule.replacement, matched, rule.name, m),
-          entityKey: isAlias ? normalizeEntity(matched) : undefined,
+          // 所有规则都计算实体键：实体决定（始终应用 / 始终保留）按此继承
+          entityKey: normalizeEntity(matched),
         });
       }
     }
@@ -302,6 +341,9 @@ export function buildPreview(input: {
   let totalHits = 0;
   let appliedHits = 0;
   let revertedHits = 0;
+  let exceptionHits = 0;
+  /** 实体决策聚合：仅统计胜出命中（被抑制项不参与、不生成例外） */
+  const entityMap = new Map<string, EntitySummary>();
 
   const cueByIndex = new Map(cues.map((c) => [c.index, c]));
   for (const { index, kept } of mergedByCue) {
@@ -309,7 +351,7 @@ export function buildPreview(input: {
     const hits: Hit[] = kept.map((h) => {
       let aliasName: string | undefined;
       const rule = ruleById.get(h.ruleId);
-      if (rule?.mode === 'alias' && h.entityKey !== undefined) {
+      if (rule?.mode === 'alias') {
         const mapKey = aliasMapKey(h.ruleId, h.entityKey);
         let entry = aliasByKey.get(mapKey);
         if (!entry) {
@@ -338,10 +380,56 @@ export function buildPreview(input: {
       }
 
       const key = hitKey(cue.index, cue.start, h);
-      const isReverted = reverted.has(key);
+      /* 最终状态：逐条例外 > 实体决定 > 默认应用 */
+      let isReverted: boolean;
+      let decisionSource: DecisionSource;
+      if (revertExceptions.has(key)) {
+        isReverted = true;
+        decisionSource = 'hit-exception';
+      } else if (applyExceptions.has(key)) {
+        isReverted = false;
+        decisionSource = 'hit-exception';
+      } else {
+        const decision = decisionByEntity.get(decisionMapKey(h.ruleId, h.entityKey));
+        if (decision === 'keep') {
+          isReverted = true;
+          decisionSource = 'entity-keep';
+        } else if (decision === 'apply') {
+          isReverted = false;
+          decisionSource = 'entity-apply';
+        } else {
+          isReverted = false;
+          decisionSource = 'default';
+        }
+      }
+      if (decisionSource === 'hit-exception') exceptionHits++;
       if (isReverted) revertedHits++;
       else appliedHits++;
       totalHits++;
+
+      /* 实体决策列表聚合 */
+      const eKey = decisionMapKey(h.ruleId, h.entityKey);
+      let summary = entityMap.get(eKey);
+      if (!summary) {
+        summary = {
+          ruleId: h.ruleId,
+          ruleName: h.ruleName,
+          entityKey: h.entityKey,
+          sample: h.match,
+          totalHits: 0,
+          appliedHits: 0,
+          revertedHits: 0,
+          exceptionHits: 0,
+          decision: decisionByEntity.get(eKey) ?? null,
+        };
+        entityMap.set(eKey, summary);
+      }
+      summary.sample = h.match;
+      summary.totalHits++;
+      if (isReverted) summary.revertedHits++;
+      else summary.appliedHits++;
+      if (decisionSource === 'hit-exception') summary.exceptionHits++;
+
       return {
         key,
         ruleId: h.ruleId,
@@ -354,10 +442,33 @@ export function buildPreview(input: {
         reverted: isReverted,
         entityKey: h.entityKey,
         alias: aliasName,
+        decisionSource,
       };
     });
     cue.hits = hits;
   }
+
+  /* 已持久决定但当前无命中的实体也列入（决定持久，新命中出现时自动继承） */
+  for (const d of decisions) {
+    const eKey = decisionMapKey(d.ruleId, d.entityKey);
+    if (entityMap.has(eKey)) continue;
+    entityMap.set(eKey, {
+      ruleId: d.ruleId,
+      ruleName: ruleById.get(d.ruleId)?.name ?? '已删除规则',
+      entityKey: d.entityKey,
+      sample: '',
+      totalHits: 0,
+      appliedHits: 0,
+      revertedHits: 0,
+      exceptionHits: 0,
+      decision: d.action,
+    });
+  }
+
+  const entities = Array.from(entityMap.values()).sort(
+    (a, b) =>
+      a.ruleName.localeCompare(b.ruleName) || a.entityKey.localeCompare(b.entityKey),
+  );
 
   return {
     cueCount: parsed.cues.length,
@@ -365,9 +476,11 @@ export function buildPreview(input: {
     appliedHits,
     revertedHits,
     suppressedHits,
+    exceptionHits,
     cues,
     parseErrors: parsed.errors,
     aliases,
+    entities,
   };
 }
 
@@ -395,9 +508,12 @@ export function exportResult(input: {
   vtt: string;
   rules: MaskRule[];
   revertedKeys?: string[];
+  appliedKeys?: string[];
+  entityDecisions?: EntityDecision[];
   aliases?: AliasEntry[];
   jobId?: string;
 }): ExportResult {
+  // 预览与导出共用同一 buildPreview，保证 VTT / 审计 JSON / 界面最终状态一致
   const preview = buildPreview(input);
   const parsed = parseVtt(input.vtt);
   const payloadByIndex = new Map<number, string>();
@@ -417,6 +533,7 @@ export function exportResult(input: {
         source: { start: h.start, end: h.end, text: h.match },
         replacement: h.replacement,
         status: h.reverted ? 'reverted' : 'applied',
+        decisionSource: h.decisionSource,
         entityKey: h.entityKey,
         alias: h.alias,
       });
@@ -430,6 +547,7 @@ export function exportResult(input: {
         source: { start: s.start, end: s.end, text: s.match },
         replacement: '',
         status: 'suppressed',
+        decisionSource: 'overlap',
         suppressedBy: { id: s.winnerRuleId, name: s.winnerRuleName },
         entityKey: s.entityKey,
       });
@@ -439,7 +557,7 @@ export function exportResult(input: {
   const sha256 = createHash('sha256').update(input.vtt, 'utf8').digest('hex');
   const audit: AuditReport = {
     app: 'subtitle-mask-console',
-    version: 2,
+    version: 3,
     generatedAt: new Date().toISOString(),
     source: {
       sha256,
@@ -452,9 +570,11 @@ export function exportResult(input: {
       appliedHits: preview.appliedHits,
       revertedHits: preview.revertedHits,
       suppressedHits: preview.suppressedHits,
+      exceptionHits: preview.exceptionHits,
     },
     records,
     aliases: preview.aliases,
+    entityDecisions: normalizeDecisions(input.entityDecisions),
   };
 
   return {

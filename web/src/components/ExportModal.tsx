@@ -22,13 +22,14 @@ export function ExportModal({ vtt, audit, onClose }: Props) {
             <code>{prefix}.vtt</code> — 脱敏后的 WebVTT（CRLF）
           </li>
           <li>
-            <code>{prefix}.json</code> — 审计报告（规则、原文区间、替换结果、抑制记录）
+            <code>{prefix}.json</code> — 审计报告（规则、原文区间、替换结果、决策来源、抑制记录）
           </li>
         </ul>
         <div className="export-stats">
           <span>应用 {audit.stats.appliedHits}</span>
           <span>撤销 {audit.stats.revertedHits}</span>
           <span>抑制 {audit.stats.suppressedHits}</span>
+          <span>例外 {audit.stats.exceptionHits}</span>
           <span>记录 {audit.records.length} 条</span>
         </div>
         <div className="modal-actions">

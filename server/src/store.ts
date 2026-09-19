@@ -20,8 +20,14 @@ export class JobStore {
     try {
       const raw = await fs.readFile(this.filePath, 'utf8');
       const parsed = JSON.parse(raw) as JobState;
-      // 兼容旧版本任务文件：补齐稳定化名表
-      this.cache = { ...parsed, aliases: parsed.aliases ?? [], revertedKeys: parsed.revertedKeys ?? [] };
+      // 兼容旧版本任务文件：补齐稳定化名表、逐条应用例外与实体决定
+      this.cache = {
+        ...parsed,
+        aliases: parsed.aliases ?? [],
+        revertedKeys: parsed.revertedKeys ?? [],
+        appliedKeys: parsed.appliedKeys ?? [],
+        entityDecisions: parsed.entityDecisions ?? [],
+      };
     } catch {
       this.cache = null;
     }
